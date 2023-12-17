@@ -573,6 +573,9 @@ class RegressionMatcher(nn.Module):
         
     def extract_backbone_features(self, batch, batched = True, upsample = True):
         #TODO: only extract stride [1,2,4,8] for upsample = True
+        # x_q = query #batch["query"]
+        # x_s = support #batch["support"]
+        
         x_q = batch["query"]
         x_s = batch["support"]
         if batched:
@@ -634,6 +637,110 @@ class RegressionMatcher(nn.Module):
         else:
             return dense_corresps
 
+    def forward_dummy(self, query, support, batched=False):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        symmetric = self.symmetric
+        self.train(False)
+        batch = {"query": query, "support": support}
+        with torch.no_grad():
+            b=1
+            # if not batched:
+            #     b = 1
+            #     w, h = im1.size
+            #     w2, h2 = im2.size
+            #     # Get images in good format
+            #     ws = self.w_resized
+            #     hs = self.h_resized
+
+            #     test_transform = get_tuple_transform_ops(
+            #         resize=(hs, ws), normalize=True
+            #     )
+            #     query, support = test_transform((im1, im2))
+            #     batch = {"query": query[None].to(device), "support": support[None].to(device)}
+            # else:
+            #     b, c, h, w = im1.shape
+            #     b, c, h2, w2 = im2.shape
+            #     assert w == w2 and h == h2, "For batched images we assume same size"
+            #     batch = {"query": im1.to(device), "support": im2.to(device)}
+            #     hs, ws = self.h_resized, self.w_resized
+            finest_scale = 1
+            # import pickle
+            # with open("input.pkl", "wb") as f:
+            #     pickle.dump(batch, f)
+            
+            # Run matcher
+            if symmetric:
+                dense_corresps  = self.forward_symmetric(batch, batched = True)
+            else:
+                dense_corresps = self.forward(batch, batched = True)
+            
+            if self.upsample_preds:
+                hs, ws = self.upsample_res
+            low_res_certainty = F.interpolate(
+            dense_corresps[16]["dense_certainty"], size=(hs, ws), align_corners=False, mode="bilinear"
+            )
+            cert_clamp = 0
+            factor = 0.5
+            low_res_certainty = factor*low_res_certainty*(low_res_certainty < cert_clamp)
+
+            if self.upsample_preds: 
+                query = F.interpolate(
+                    query, size=(hs, ws), align_corners=False, mode="bilinear"
+                )
+                support = F.interpolate(
+                    support, size=(hs, ws), align_corners=False, mode="bilinear"
+                )
+                batch = {"query": query, "support": support, "corresps": dense_corresps[finest_scale]}
+                if symmetric:
+                    dense_corresps = self.forward_symmetric(batch, upsample = True, batched=True)
+                else:
+                    dense_corresps = self.forward(batch, batched = True, upsample=True)
+            query_to_support = dense_corresps[finest_scale]["dense_flow"]
+            dense_certainty = dense_corresps[finest_scale]["dense_certainty"]
+            
+            # Get certainty interpolation
+            dense_certainty = dense_certainty - low_res_certainty
+            query_to_support = query_to_support.permute(
+                0, 2, 3, 1
+                )
+            # Create im1 meshgrid
+            query_coords = torch.meshgrid(
+                (
+                    torch.linspace(-1 + 1 / hs, 1 - 1 / hs, hs, device=device),
+                    torch.linspace(-1 + 1 / ws, 1 - 1 / ws, ws, device=device),
+                )
+            )
+            query_coords = torch.stack((query_coords[1], query_coords[0]))
+            query_coords = query_coords[None].expand(b, 2, hs, ws)
+            dense_certainty = dense_certainty.sigmoid()  # logits -> probs
+            query_coords = query_coords.permute(0, 2, 3, 1)
+            if (query_to_support.abs() > 1).any() and True:
+                wrong = (query_to_support.abs() > 1).sum(dim=-1) > 0
+                dense_certainty[wrong[:,None]] = 0
+                
+            query_to_support = torch.clamp(query_to_support, -1, 1)
+            if symmetric:
+                support_coords = query_coords
+                qts, stq = query_to_support.chunk(2)                    
+                q_warp = torch.cat((query_coords, qts), dim=-1)
+                s_warp = torch.cat((stq, support_coords), dim=-1)
+                warp = torch.cat((q_warp, s_warp),dim=2)
+                dense_certainty = torch.cat(dense_certainty.chunk(2), dim=3)[:,0]
+            else:
+                warp = torch.cat((query_coords, query_to_support), dim=-1)
+            if batched:
+                return (
+                    warp,
+                    dense_certainty
+                )
+            else:
+                return (
+                    warp[0],
+                    dense_certainty[0],
+                )
+
+    
+
     def forward_symmetric(self, batch, upsample = False, batched = True):
         feature_pyramid = self.extract_backbone_features(batch, upsample = upsample, batched = batched)
         f_q_pyramid = feature_pyramid
@@ -688,6 +795,10 @@ class RegressionMatcher(nn.Module):
                 batch = {"query": im1.to(device), "support": im2.to(device)}
                 hs, ws = self.h_resized, self.w_resized
             finest_scale = 1
+            # import pickle
+            # with open("input.pkl", "wb") as f:
+            #     pickle.dump(batch, f)
+            
             # Run matcher
             if symmetric:
                 dense_corresps  = self.forward_symmetric(batch, batched = True)
@@ -703,12 +814,20 @@ class RegressionMatcher(nn.Module):
             factor = 0.5
             low_res_certainty = factor*low_res_certainty*(low_res_certainty < cert_clamp)
 
-            if self.upsample_preds: 
-                test_transform = get_tuple_transform_ops(
-                    resize=(hs, ws), normalize=True
-                )
-                query, support = test_transform((im1, im2))
-                query, support = query[None].to(device), support[None].to(device)
+            if self.upsample_preds:
+                if False: 
+                    test_transform = get_tuple_transform_ops(
+                        resize=(hs, ws), normalize=True
+                    )
+                    query, support = test_transform((im1, im2))
+                    query, support = query[None].to(device), support[None].to(device)
+                else:
+                    query = F.interpolate(
+                        batch["query"], size=(hs, ws), align_corners=False, mode="bilinear"
+                    )
+                    support = F.interpolate(
+                        batch["support"], size=(hs, ws), align_corners=False, mode="bilinear"
+                    )
                 batch = {"query": query, "support": support, "corresps": dense_corresps[finest_scale]}
                 if symmetric:
                     dense_corresps = self.forward_symmetric(batch, upsample = True, batched=True)
